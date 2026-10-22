@@ -46,9 +46,12 @@ import (
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -129,7 +132,8 @@ var _ = Describe("CloudProvider Integration Tests", func() {
 			cpgProvider))
 		cloudProvider = lo.Must(New(ctx, k8sClient, instancetypeProvider, imageProvider,
 			networkProvider, kmsProvider, instanceProvider, placementProvider,
-			crProvider, bsProvider, npnProvider, nil, false, fakes.NewDummyChannel()))
+			crProvider, bsProvider, npnProvider, nodeoverlay.NewInstanceTypeStore(), nil, false,
+			fakes.NewDummyChannel()))
 	})
 
 	It("should create nodeclaim with nodeclass hash", func() {
@@ -574,6 +578,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 			instanceA   *instancetype.OciInstanceType
 			instanceB   *instancetype.OciInstanceType
 			imageResult *image.ImageResolveResult
+			createCtx   context.Context
 		)
 
 		BeforeEach(func() {
@@ -584,10 +589,11 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 			instanceA = testInstanceType(testShapeA, 10)
 			instanceB = testInstanceType("shape-b", 20)
 			imageResult = testImageResolveResult(testImageID)
+			createCtx = coreoptions.ToContext(context.Background(), coretest.Options())
 		})
 
 		It("should reject creates before the cloud provider is initialized", func() {
-			_, err := (&CloudProvider{}).Create(context.Background(), nodeClaim)
+			_, err := (&CloudProvider{}).Create(createCtx, nodeClaim)
 			Expect(err).To(MatchError(ContainSubstring("cloud-provider is not ready for use")))
 		})
 
@@ -597,7 +603,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				instanceTypes: []*instancetype.OciInstanceType{instanceA},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			var createErr *cloudprovider.CreateError
 			Expect(errors.As(err, &createErr)).To(BeTrue())
 			Expect(createErr.ConditionReason).To(Equal("OciNodeClassNotFound"))
@@ -609,8 +615,117 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				instanceTypes: nil,
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+		})
+
+		Context("with NodeOverlays", func() {
+			const kvmDevice = corev1.ResourceName("devices.kubevirt.io/kvm")
+
+			var (
+				overlayCtx context.Context
+				store      *nodeoverlay.InstanceTypeStore
+				launched   []string
+			)
+
+			BeforeEach(func() {
+				overlayCtx = coreoptions.ToContext(context.Background(), coretest.Options(coretest.OptionsFields{
+					FeatureGates: coretest.FeatureGates{NodeOverlay: lo.ToPtr(true)},
+				}))
+				store = nodeoverlay.NewInstanceTypeStore()
+				launched = nil
+			})
+
+			// newOverlayCloudProvider returns a cloud provider whose store holds the given overlays,
+			// evaluated by the nodeoverlay controller as the operator does.
+			newOverlayCloudProvider := func(its []*instancetype.OciInstanceType,
+				overlays ...*v1alpha1.NodeOverlay) *CloudProvider {
+				objs := []client.Object{nodeClass, nodePool}
+				for _, o := range overlays {
+					objs = append(objs, o)
+				}
+				kubeClient := clientfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(objs...).
+					WithStatusSubresource(&v1alpha1.NodeOverlay{}).Build()
+				cp := newUnitTestCloudProvider(unitTestCloudProviderOptions{
+					kubeClient:        kubeClient,
+					instanceTypes:     its,
+					instanceTypeStore: store,
+					instanceProvider: &FakeInstanceProvider{
+						LaunchInstanceFn: func(_ context.Context, nc *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+							it *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+							_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+							launched = append(launched, it.Shape)
+							return &instance.InstanceInfo{
+								Instance: testInstanceWithShape(it.Shape, nc.Labels[v1.NodePoolLabelKey]),
+							}, nil
+						},
+					},
+				})
+				clk := clock.RealClock{}
+				controller := nodeoverlay.NewController(clk, kubeClient, cp, store, state.NewCluster(clk, kubeClient, cp))
+				_, err := controller.Reconcile(overlayCtx, reconcile.Request{})
+				Expect(err).ToNot(HaveOccurred())
+				return cp
+			}
+
+			It("should launch for a request that only a NodeOverlay's capacity satisfies", func() {
+				overlay := testNodeOverlay("kvm", testShapeA)
+				overlay.Spec.Capacity = corev1.ResourceList{kvmDevice: resource.MustParse("1k")}
+				cp := newOverlayCloudProvider([]*instancetype.OciInstanceType{instanceA}, overlay)
+				nodeClaim.Spec.Resources.Requests = corev1.ResourceList{kvmDevice: resource.MustParse("1")}
+
+				created, err := cp.Create(overlayCtx, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal(testShapeA))
+			})
+
+			It("should not apply NodeOverlays when the feature gate is off", func() {
+				overlay := testNodeOverlay("kvm", testShapeA)
+				overlay.Spec.Capacity = corev1.ResourceList{kvmDevice: resource.MustParse("1k")}
+				cp := newOverlayCloudProvider([]*instancetype.OciInstanceType{instanceA}, overlay)
+				nodeClaim.Spec.Resources.Requests = corev1.ResourceList{kvmDevice: resource.MustParse("1")}
+
+				_, err := cp.Create(createCtx, nodeClaim)
+				Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+				Expect(launched).To(BeEmpty())
+			})
+
+			It("should not launch for a NodePool whose overlays haven't been evaluated yet", func() {
+				cp := newOverlayCloudProvider([]*instancetype.OciInstanceType{instanceA})
+				nodeClaim.Labels[v1.NodePoolLabelKey] = "pool-not-yet-evaluated"
+
+				_, err := cp.Create(overlayCtx, nodeClaim)
+				var createErr *cloudprovider.CreateError
+				Expect(errors.As(err, &createErr)).To(BeTrue())
+				Expect(createErr.ConditionReason).To(Equal("InstanceTypeResolutionFailed"))
+				Expect(launched).To(BeEmpty())
+			})
+
+			It("should launch a NodeClaim without a NodePool from the instance types as listed", func() {
+				overlay := testNodeOverlay("kvm", testShapeA)
+				overlay.Spec.Capacity = corev1.ResourceList{kvmDevice: resource.MustParse("1k")}
+				cp := newOverlayCloudProvider([]*instancetype.OciInstanceType{instanceA}, overlay)
+				delete(nodeClaim.Labels, v1.NodePoolLabelKey)
+
+				_, err := cp.Create(overlayCtx, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(launched).To(Equal([]string{testShapeA}))
+
+				nodeClaim.Spec.Resources.Requests = corev1.ResourceList{kvmDevice: resource.MustParse("1")}
+				_, err = cp.Create(overlayCtx, nodeClaim)
+				Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+			})
+
+			It("should try instance types in order of their NodeOverlay-adjusted price", func() {
+				overlay := testNodeOverlay("cheaper-b", "shape-b")
+				overlay.Spec.PriceAdjustment = lo.ToPtr("-99%")
+				cp := newOverlayCloudProvider([]*instancetype.OciInstanceType{instanceA, instanceB}, overlay)
+
+				created, err := cp.Create(overlayCtx, nodeClaim)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(launched).To(Equal([]string{"shape-b"}))
+				Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal("shape-b"))
+			})
 		})
 
 		It("should fall back to the next instance type when image resolution fails", func() {
@@ -635,7 +750,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			created, err := cp.Create(context.Background(), nodeClaim)
+			created, err := cp.Create(createCtx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal("shape-b"))
 		})
@@ -678,7 +793,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			created, err := cp.Create(context.Background(), nodeClaim)
+			created, err := cp.Create(createCtx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(created).ToNot(BeNil())
 			// Both shape configs were attempted: the first failed with OOHC, the second succeeded.
@@ -717,7 +832,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			created, err := cp.Create(context.Background(), nodeClaim)
+			created, err := cp.Create(createCtx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal("shape-b"))
 			Expect(launchCount).To(Equal(2))
@@ -744,7 +859,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
 			var createErr *cloudprovider.CreateError
 			Expect(errors.As(err, &createErr)).To(BeFalse())
@@ -770,7 +885,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			var createErr *cloudprovider.CreateError
 			Expect(errors.As(err, &createErr)).To(BeTrue())
 			Expect(createErr.ConditionReason).To(Equal("LaunchInstanceFailed"))
@@ -797,7 +912,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
 			Expect(launchCount).To(Equal(2))
 		})
@@ -824,7 +939,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
 			Expect(launchCount).To(Equal(2))
 		})
@@ -850,7 +965,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			_, err := cp.Create(context.Background(), nodeClaim)
+			_, err := cp.Create(createCtx, nodeClaim)
 			var createErr *cloudprovider.CreateError
 			Expect(errors.As(err, &createErr)).To(BeTrue())
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeFalse())
@@ -882,7 +997,7 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 				},
 			})
 
-			created, err := cp.Create(context.Background(), nodeClaim)
+			created, err := cp.Create(createCtx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal("shape-b"))
 			Expect(launchCount).To(Equal(2))
@@ -992,6 +1107,7 @@ type unitTestCloudProviderOptions struct {
 	npnProvider                 npn.Provider
 	repairPolicies              []cloudprovider.RepairPolicy
 	enableServiceLimitFallback  bool
+	instanceTypeStore           *nodeoverlay.InstanceTypeStore
 }
 
 func newUnitTestCloudProvider(opts unitTestCloudProviderOptions) *CloudProvider {
@@ -1019,6 +1135,7 @@ func newUnitTestCloudProvider(opts unitTestCloudProviderOptions) *CloudProvider 
 		npnProvider:                 &FakeNpnProvider{},
 		repairPolicies:              opts.repairPolicies,
 		enableServiceLimitFallback:  opts.enableServiceLimitFallback,
+		instanceTypeStore:           opts.instanceTypeStore,
 	}
 
 	if opts.imageProvider != nil {
@@ -1117,6 +1234,19 @@ func testNodePool(name, nodeClassName string) *v1.NodePool {
 					}},
 				},
 			},
+		},
+	}
+}
+
+func testNodeOverlay(name, shape string) *v1alpha1.NodeOverlay {
+	return &v1alpha1.NodeOverlay{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1alpha1.NodeOverlaySpec{
+			Requirements: []v1alpha1.NodeSelectorRequirement{{
+				Key:      corev1.LabelInstanceTypeStable,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{shape},
+			}},
 		},
 	}
 }

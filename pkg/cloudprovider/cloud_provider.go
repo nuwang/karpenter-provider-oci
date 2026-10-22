@@ -43,6 +43,8 @@ import (
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	corev1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -58,6 +60,7 @@ type CloudProvider struct {
 	capacityReservationProvider capacityreservation.Provider
 	blockStorageProvider        blockstorage.Provider
 	npnProvider                 npn.Provider
+	instanceTypeStore           *nodeoverlay.InstanceTypeStore
 	repairPolicies              []cloudprovider.RepairPolicy
 	enableServiceLimitFallback  bool
 	initialized                 bool
@@ -66,6 +69,7 @@ type CloudProvider struct {
 func New(ctx context.Context, client client.Client, itp instancetype.Provider, imgp image.Provider,
 	nwp network.Provider, kkp kms.Provider, ip instance.Provider, pp placement.Provider,
 	cp capacityreservation.Provider, bsp blockstorage.Provider, npn npn.Provider,
+	store *nodeoverlay.InstanceTypeStore,
 	repairPolicies []cloudprovider.RepairPolicy, enableServiceLimitFallback bool,
 	startAsync <-chan struct{}) (*CloudProvider, error) {
 	c := &CloudProvider{
@@ -79,6 +83,7 @@ func New(ctx context.Context, client client.Client, itp instancetype.Provider, i
 		capacityReservationProvider: cp,
 		blockStorageProvider:        bsp,
 		npnProvider:                 npn,
+		instanceTypeStore:           store,
 		enableServiceLimitFallback:  enableServiceLimitFallback,
 	}
 
@@ -315,6 +320,10 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	instanceTypes, err = c.applyNodeOverlays(ctx, nodeClaim, instanceTypes)
+	if err != nil {
+		return nil, err
+	}
 
 	/*
 		 how schedule requirement works:
@@ -335,6 +344,35 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context,
 		return len(i.Offerings.Compatible(reqs).Available()) > 0 &&
 			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
 	}), nil
+}
+
+// applyNodeOverlays gives launch the same view of each instance type that scheduling had.
+// NodeOverlays can add capacity, such as an extended resource a device plugin advertises once
+// the node is up, and adjust prices. Without them, a NodeClaim that requests an overlay's
+// resource fits no instance type, and the launch order ignores overlay prices.
+// As in core's scheduling, a NodeClaim without a NodePool gets no overlays.
+func (c *CloudProvider) applyNodeOverlays(ctx context.Context, nodeClaim *corev1.NodeClaim,
+	instanceTypes []*instancetype.OciInstanceType) ([]*instancetype.OciInstanceType, error) {
+	if !coreoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		return instanceTypes, nil
+	}
+	nodePoolName, ok := nodeClaim.Labels[corev1.NodePoolLabelKey]
+	if !ok {
+		return instanceTypes, nil
+	}
+	overlaid := make([]*instancetype.OciInstanceType, 0, len(instanceTypes))
+	for _, it := range instanceTypes {
+		applied, err := c.instanceTypeStore.Apply(nodePoolName, &it.InstanceType)
+		if err != nil {
+			return nil, fmt.Errorf("applying nodeoverlays, %w", err)
+		}
+		if applied == &it.InstanceType {
+			overlaid = append(overlaid, it)
+			continue
+		}
+		overlaid = append(overlaid, it.WithOverlay(applied))
+	}
+	return overlaid, nil
 }
 
 func orderInstanceTypesByPrice(instanceTypes []*instancetype.OciInstanceType,

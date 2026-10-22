@@ -51,6 +51,26 @@ func (it *OciInstanceType) CopyAndUpdateOfferings(newOfferings cloudprovider.Off
 	}
 }
 
+// WithOverlay returns a copy of the instance type that carries the capacity and offerings of
+// overlaid, the result of applying NodeOverlays to it.
+func (it *OciInstanceType) WithOverlay(overlaid *cloudprovider.InstanceType) *OciInstanceType {
+	return &OciInstanceType{
+		InstanceType: cloudprovider.InstanceType{
+			Name:             overlaid.Name,
+			Requirements:     overlaid.Requirements,
+			Offerings:        overlaid.Offerings,
+			Capacity:         overlaid.Capacity,
+			DynamicResources: overlaid.DynamicResources,
+			Overhead:         overlaid.Overhead,
+		},
+		SupportShapeConfig:      it.SupportShapeConfig,
+		Ocpu:                    it.Ocpu,
+		MemoryInGbs:             it.MemoryInGbs,
+		BaselineOcpuUtilization: it.BaselineOcpuUtilization,
+		Shape:                   it.Shape,
+	}
+}
+
 func (it *OciInstanceType) Print() string {
 	var sb strings.Builder
 	sb.WriteString(it.InstanceType.Name)

@@ -37,6 +37,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	coretest "sigs.k8s.io/karpenter/pkg/test"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -62,6 +64,7 @@ var _ = BeforeSuite(func() {
 
 	ctx, cancel = context.WithCancel(context.TODO())
 	ctx = options.ToContext(ctx, &options.Options{})
+	ctx = coreoptions.ToContext(ctx, coretest.Options())
 
 	var err error
 	err = ocioraclecouldcomv1beta1.AddToScheme(scheme.Scheme)
